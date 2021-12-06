@@ -113,8 +113,6 @@ export class CannonJSPlugin implements IPhysicsEnginePlugin {
 
         //should a new body be created for this impostor?
         if (impostor.isBodyInitRequired()) {
-            var shape = this._createShape(impostor);
-
             //unregister events, if body is being changed
             var oldBody = impostor.physicsBody;
             if (oldBody) {
@@ -139,7 +137,7 @@ export class CannonJSPlugin implements IPhysicsEnginePlugin {
             impostor.physicsBody.addEventListener("collide", impostor.onCollide);
             this.world.addEventListener("preStep", impostor.beforeStep);
             this.world.addEventListener("postStep", impostor.afterStep);
-            impostor.physicsBody.addShape(shape);
+            this._createAndAddShape(impostor);
             if (typeof this.world.addBody === 'function') {
                 this.world.addBody(impostor.physicsBody);
             } else {
@@ -189,7 +187,9 @@ export class CannonJSPlugin implements IPhysicsEnginePlugin {
                         }
                         childImpostor.parent = mainImpostor;
                         childImpostor.resetUpdateFlags();
-                        mainImpostor.physicsBody.addShape(this._createShape(childImpostor), new this.BJSCANNON.Vec3(pPosition.x, pPosition.y, pPosition.z), new this.BJSCANNON.Quaternion(q.x, q.y, q.z, q.w));
+
+                        this._createAndAddShape(childImpostor, new this.BJSCANNON.Vec3(pPosition.x, pPosition.y, pPosition.z), new this.BJSCANNON.Quaternion(q.x, q.y, q.z, q.w), mainImpostor);
+
                         //Add the mass of the children.
                         mainImpostor.physicsBody.mass += childImpostor.getParam("mass");
                     }
@@ -305,10 +305,13 @@ export class CannonJSPlugin implements IPhysicsEnginePlugin {
         return value < PhysicsEngine.Epsilon ? PhysicsEngine.Epsilon : value;
     }
 
-    private _createShape(impostor: PhysicsImpostor) {
+    private _createAndAddShape(impostor: PhysicsImpostor, position: any = null, quaternion: any = null, parentImpostor = impostor) {
         var object = impostor.object;
+        const offset = new this.BJSCANNON.Vec3(0, 0, 0);
+        position = position || new this.BJSCANNON.Vec3(0, 0, 0);
+        quaternion = quaternion || new this.BJSCANNON.Quaternion(0, 0, 0, 1);
 
-        var returnValue;
+        var shape;
         var extendSize = impostor.getObjectExtendSize();
         switch (impostor.type) {
             case PhysicsImpostor.SphereImpostor:
@@ -316,7 +319,7 @@ export class CannonJSPlugin implements IPhysicsEnginePlugin {
                 var radiusY = extendSize.y;
                 var radiusZ = extendSize.z;
 
-                returnValue = new this.BJSCANNON.Sphere(Math.max(this._checkWithEpsilon(radiusX), this._checkWithEpsilon(radiusY), this._checkWithEpsilon(radiusZ)) / 2);
+                shape = new this.BJSCANNON.Sphere(Math.max(this._checkWithEpsilon(radiusX), this._checkWithEpsilon(radiusY), this._checkWithEpsilon(radiusZ)) / 2);
 
                 break;
             //TMP also for cylinder - TODO Cannon supports cylinder natively.
@@ -329,23 +332,24 @@ export class CannonJSPlugin implements IPhysicsEnginePlugin {
                 let radiusBottom = nativeParams.radiusBottom !== undefined ? nativeParams.radiusBottom : this._checkWithEpsilon(extendSize.x) / 2;
                 let height = nativeParams.height !== undefined ? nativeParams.height : this._checkWithEpsilon(extendSize.y);
                 let numSegments = nativeParams.numSegments !== undefined ? nativeParams.numSegments : 16;
-                returnValue = new this.BJSCANNON.Cylinder(radiusTop, radiusBottom, height, numSegments);
+                shape = new this.BJSCANNON.Cylinder(radiusTop, radiusBottom, height, numSegments);
 
                 // Rotate 90 degrees as this shape is horizontal in cannon
                 var quat = new this.BJSCANNON.Quaternion();
                 quat.setFromAxisAngle(new this.BJSCANNON.Vec3(1, 0, 0), -Math.PI / 2);
                 var translation = new this.BJSCANNON.Vec3(0, 0, 0);
-                returnValue.transformAllPoints(translation, quat);
+                shape.transformAllPoints(translation, quat);
                 break;
             case PhysicsImpostor.BoxImpostor:
                 var box = extendSize.scale(0.5);
-                returnValue = new this.BJSCANNON.Box(new this.BJSCANNON.Vec3(this._checkWithEpsilon(box.x), this._checkWithEpsilon(box.y), this._checkWithEpsilon(box.z)));
+                shape = new this.BJSCANNON.Box(new this.BJSCANNON.Vec3(this._checkWithEpsilon(box.x), this._checkWithEpsilon(box.y), this._checkWithEpsilon(box.z)));
                 break;
             case PhysicsImpostor.PlaneImpostor:
                 Logger.Warn("Attention, PlaneImposter might not behave as you expect. Consider using BoxImposter instead");
-                returnValue = new this.BJSCANNON.Plane();
+                shape = new this.BJSCANNON.Plane();
                 break;
             case PhysicsImpostor.MeshImpostor:
+            case PhysicsImpostor.ConvexHullImpostor:
                 // should transform the vertex data to world coordinates!!
                 var rawVerts = object.getVerticesData ? object.getVerticesData(VertexBuffer.PositionKind) : [];
                 var rawFaces = object.getIndices ? object.getIndices() : [];
@@ -370,8 +374,44 @@ export class CannonJSPlugin implements IPhysicsEnginePlugin {
                     Vector3.TransformCoordinates(Vector3.FromArray(rawVerts, index), transform).toArray(temp, index);
                 }
 
-                Logger.Warn("MeshImpostor only collides against spheres.");
-                returnValue = new this.BJSCANNON.Trimesh(temp, <number[]>rawFaces);
+                if (impostor.type === PhysicsImpostor.MeshImpostor) {
+                    shape = new this.BJSCANNON.Trimesh(temp, <number[]>rawFaces);
+                    Logger.Warn("MeshImpostor only collides against spheres.");
+                } else {
+                    const facesArray = [];
+                    const verticesArray = [];
+                    if (!rawFaces) {
+                        rawFaces = [];
+                    }
+                    for (let vertexIndex = 0; vertexIndex < temp.length - 2; vertexIndex += 3) {
+                        verticesArray.push(new this.BJSCANNON.Vec3(
+                            temp[vertexIndex],
+                            temp[vertexIndex + 1],
+                            temp[vertexIndex + 2]
+                        ));
+                    }
+
+                    // We'll find the average and use it as an offset.
+                    const sum = new this.BJSCANNON.Vec3(0, 0, 0);
+                    verticesArray.forEach((vertex) => {
+                        sum.vadd(vertex, sum);
+                    });
+                    const average = sum.mult(verticesArray.length > 0 ? 1.0 / verticesArray.length : 0);
+                    offset.vadd(average);
+                    const offsetVerticesArray = verticesArray.map((vertex) => vertex.vsub(average));
+
+                    for (let faceIndex = 0; faceIndex < rawFaces.length - 2; faceIndex += 3) {
+                        // CannonJS requires CCW face indices ordering, else it detects
+                        // normals as pointing inwards.
+                        facesArray.push([
+                            rawFaces[faceIndex],
+                            rawFaces[faceIndex + 2],
+                            rawFaces[faceIndex + 1]
+                        ]);
+                    }
+
+                    shape = new this.BJSCANNON.ConvexPolyhedron(offsetVerticesArray, facesArray);
+                }
                 //now set back the transformation!
                 object.position.copyFrom(oldPosition);
                 oldRotation && object.rotation && object.rotation.copyFrom(oldRotation);
@@ -387,21 +427,21 @@ export class CannonJSPlugin implements IPhysicsEnginePlugin {
                 object.rotationQuaternion && object.parent && object.rotationQuaternion.conjugateInPlace();
                 object.rotationQuaternion && object.rotationQuaternion.multiplyInPlace(this._minus90X);
 
-                returnValue = this._createHeightmap(object);
+                shape = this._createHeightmap(object);
                 object.position.copyFrom(oldPosition2);
                 oldRotation2 && object.rotation && object.rotation.copyFrom(oldRotation2);
                 oldQuaternion2 && object.rotationQuaternion && object.rotationQuaternion.copyFrom(oldQuaternion2);
                 object.computeWorldMatrix(true);
                 break;
             case PhysicsImpostor.ParticleImpostor:
-                returnValue = new this.BJSCANNON.Particle();
+                shape = new this.BJSCANNON.Particle();
                 break;
             case PhysicsImpostor.NoImpostor:
-                returnValue = new this.BJSCANNON.Box(new this.BJSCANNON.Vec3(0, 0, 0));
+                shape = new this.BJSCANNON.Box(new this.BJSCANNON.Vec3(0, 0, 0));
                 break;
         }
 
-        return returnValue;
+        parentImpostor.physicsBody.addShape(shape, offset);
     }
 
     private _createHeightmap(object: IPhysicsEnabledObject, pointDepth?: number) {
